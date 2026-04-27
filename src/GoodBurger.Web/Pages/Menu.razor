@@ -1,0 +1,47 @@
+@page "/menu"
+@attribute [Authorize]
+@inject IMenuService MenuService
+
+<PageTitle>Cardápio — Good Burger</PageTitle>
+
+<MudText Typo="Typo.h5" Class="mb-4">📋 Cardápio</MudText>
+
+@if (_loading)
+{
+    <MudProgressLinear Indeterminate="true" Color="Color.Primary" />
+}
+else
+{
+    <MudGrid>
+        @foreach (var category in _groupedItems.Keys)
+        {
+            <MudItem xs="12">
+                <MudText Typo="Typo.h6" Class="mb-2 mt-2">@category</MudText>
+                <MudTable Items="@_groupedItems[category]" Dense="true" Hover="true" Elevation="2">
+                    <HeaderContent>
+                        <MudTh>Item</MudTh>
+                        <MudTh Style="text-align:right">Preço</MudTh>
+                    </HeaderContent>
+                    <RowTemplate>
+                        <MudTd>@context.Name</MudTd>
+                        <MudTd Style="text-align:right">@context.FormattedPrice</MudTd>
+                    </RowTemplate>
+                </MudTable>
+            </MudItem>
+        }
+    </MudGrid>
+}
+
+@code {
+    private bool _loading = true;
+    private Dictionary<string, List<MenuItemModel>> _groupedItems = new();
+
+    protected override async Task OnInitializedAsync()
+    {
+        var items = await MenuService.GetMenuAsync();
+        _groupedItems = items
+            .GroupBy(i => i.CategoryLabel)
+            .ToDictionary(g => g.Key, g => g.ToList());
+        _loading = false;
+    }
+}

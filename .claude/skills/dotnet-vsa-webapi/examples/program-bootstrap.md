@@ -1,0 +1,221 @@
+# Example: program bootstrap
+
+This example shows a pragmatic `Program.cs` baseline for a Vertical Slice Minimal API application.
+
+It includes:
+
+- built-in OpenAPI
+- Scalar UI
+- FluentValidation registration
+- strongly typed options
+- EF Core
+- Serilog
+- OpenTelemetry via Aspire ServiceDefaults
+- health checks
+- slice endpoint registration
+
+## Package sketch
+
+Typical packages for this baseline:
+
+```text
+Npgsql.EntityFrameworkCore.PostgreSQL
+Microsoft.Extensions.Diagnostics.HealthChecks.EntityFrameworkCore
+Microsoft.AspNetCore.OpenApi
+Scalar.AspNetCore
+FluentValidation
+FluentValidation.DependencyInjectionExtensions
+Serilog.AspNetCore
+Serilog.Sinks.Console
+```
+
+> **Note on `Aspire.Npgsql.EntityFrameworkCore.PostgreSQL`**: As of Aspire 9.x, this component depends on `Npgsql.EntityFrameworkCore.PostgreSQL 9.x` which requires EF Core 9. On .NET 10 projects using EF Core 10, this creates a version conflict. Use `Npgsql.EntityFrameworkCore.PostgreSQL` directly with `UseNpgsql()` instead. When the Aspire Npgsql component is updated for EF Core 10, you can switch back to `builder.AddNpgsqlDbContext<>()`.
+
+OpenTelemetry packages are provided by the ServiceDefaults project and do not need to be referenced directly by the API project.
+
+> **IMPORTANT**: Always use Aspire for new projects. Never use `UseInMemoryDatabase()` — it does not support transactions, constraints, or SQL features, and hides real bugs. Use Aspire AppHost to auto-start a PostgreSQL container for local development.
+
+## `Program.cs`
+
+```csharp
+using FluentValidation;
+using Microsoft.EntityFrameworkCore;
+using Scalar.AspNetCore;
+using ServiceDefaults;
+using Serilog;
+using Shipments.Api.Features.Shipments.CreateShipment;
+using Shipments.Api.Features.Shipments.GetShipmentById;
+using Shipments.Api.Infrastructure.Persistence;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// Aspire ServiceDefaults: OpenTelemetry, health checks, resilience, service discovery
+builder.AddServiceDefaults();
+
+builder.Host.UseSerilog((context, services, logger) =>
+{
+    logger
+        .ReadFrom.Configuration(context.Configuration)
+        .ReadFrom.Services(services)
+        .Enrich.FromLogContext()
+        .WriteTo.Console();
+});
+
+builder.Services.AddOpenApi();
+
+// EF Core + Npgsql: resolves connection string from ConnectionStrings config
+// Aspire AppHost injects ConnectionStrings:shipments-db automatically during local dev
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseNpgsql(builder.Configuration.GetConnectionString("shipments-db")));
+
+builder.Services.AddValidatorsFromAssemblyContaining<CreateShipmentRequestValidator>();
+
+builder.Services.AddScoped<ICreateShipmentHandler, CreateShipmentHandler>();
+builder.Services.AddScoped<IGetShipmentByIdHandler, GetShipmentByIdHandler>();
+builder.Services.AddSingleton<IShipmentNumberGenerator, UtcShipmentNumberGenerator>();
+builder.Services.AddScoped<IDbConnectionFactory, NpgsqlConnectionFactory>();
+builder.Services.AddSingleton(TimeProvider.System);
+
+// Readiness health check — verifies the database is reachable.
+// The liveness check comes from ServiceDefaults.
+builder.Services.AddHealthChecks()
+    .AddDbContextCheck<AppDbContext>("AppDbContext-ready", tags: ["ready"]);
+
+builder.Services.Configure<HostOptions>(options =>
+{
+    options.ShutdownTimeout = TimeSpan.FromSeconds(30);
+});
+
+var app = builder.Build();
+
+app.UseSerilogRequestLogging();
+
+app.UseExceptionHandler("/error");
+app.Map("/error", () => Results.Problem(
+    title: "An unexpected error occurred.",
+    statusCode: StatusCodes.Status500InternalServerError));
+
+// ServiceDefaults: maps /health/live and /health/ready endpoints
+app.MapDefaultEndpoints();
+
+app.MapOpenApi();
+app.MapScalarApiReference(options =>
+{
+    options.Title = "Shipments API";
+    options.Theme = ScalarTheme.DeepSpace;
+    options.DefaultHttpClient = new(ScalarTarget.CSharp, ScalarClient.HttpClient);
+});
+
+if (app.Environment.IsDevelopment())
+{
+    app.MapGet("/", () => Results.Redirect("/scalar/v1"))
+        .ExcludeFromDescription();
+}
+
+app.MapCreateShipment();
+app.MapGetShipmentById();
+
+var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
+
+lifetime.ApplicationStarted.Register(() =>
+    Log.Information("Application started"));
+
+lifetime.ApplicationStopping.Register(() =>
+    Log.Information("Application is shutting down..."));
+
+lifetime.ApplicationStopped.Register(() =>
+{
+    Log.Information("Application stopped");
+    Log.CloseAndFlush();
+});
+
+app.Run();
+
+public class UtcShipmentNumberGenerator : IShipmentNumberGenerator
+{
+    public string Next() => $"SHP-{DateTime.UtcNow:yyyyMMddHHmmssfff}";
+}
+```
+
+## `Infrastructure/Persistence/NpgsqlConnectionFactory.cs`
+
+Uses `IConfiguration` to resolve the same connection string as EF Core. Both EF Core and Dapper share the same `ConnectionStrings:shipments-db` key, which Aspire AppHost injects automatically during local development.
+
+```csharp
+using System.Data;
+using Npgsql;
+
+namespace Shipments.Api.Infrastructure.Persistence;
+
+public class NpgsqlConnectionFactory(IConfiguration configuration) : IDbConnectionFactory
+{
+    public async Task<IDbConnection> OpenConnectionAsync(CancellationToken cancellationToken)
+    {
+        var connectionString = configuration.GetConnectionString("shipments-db");
+        var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+        return connection;
+    }
+}
+```
+
+## `Infrastructure/Persistence/AppDbContext.cs`
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+using Shipments.Api.Domain.Shipments;
+
+namespace Shipments.Api.Infrastructure.Persistence;
+
+public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(options)
+{
+    public DbSet<Shipment> Shipments => Set<Shipment>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.ApplyConfigurationsFromAssembly(typeof(AppDbContext).Assembly);
+    }
+}
+```
+
+## `Infrastructure/Persistence/Configurations/ShipmentConfiguration.cs`
+
+Each entity gets its own configuration file implementing `IEntityTypeConfiguration<T>`. This keeps the DbContext clean and places configuration close to the domain entity it describes.
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using Shipments.Api.Domain.Shipments;
+
+namespace Shipments.Api.Infrastructure.Persistence.Configurations;
+
+public class ShipmentConfiguration : IEntityTypeConfiguration<Shipment>
+{
+    public void Configure(EntityTypeBuilder<Shipment> builder)
+    {
+        builder.ToTable("shipments");
+        builder.HasKey(x => x.Id);
+
+        builder.Property(x => x.Number).HasMaxLength(64);
+        builder.Property(x => x.OrderId).HasMaxLength(64);
+        builder.Property(x => x.RecipientEmail).HasMaxLength(256);
+        builder.Property(x => x.DestinationCountryCode).HasMaxLength(2);
+
+        builder.HasIndex(x => x.OrderId).IsUnique();
+    }
+}
+```
+
+Place configuration files in `Infrastructure/Persistence/Configurations/`. The naming convention is `{EntityName}Configuration.cs`.
+
+## Why this bootstrap is the default
+
+- **Aspire ServiceDefaults** provides OpenTelemetry, health checks, resilience, and service discovery out of the box.
+- **EF Core + Npgsql direct** resolves connection strings from `ConnectionStrings` config — Aspire AppHost injects them automatically during local dev.
+- Built-in OpenAPI + Scalar is the current default path.
+- Validation is explicit and Minimal-API friendly.
+- Serilog is the baseline logger.
+- Health checks are split into liveness (ServiceDefaults) and readiness (DbContext check).
+- Slice endpoints are registered explicitly, not by magic scanning.
+- **Production**: connection string comes from `ConnectionStrings:shipments-db` in `appsettings.json` or environment variable `ConnectionStrings__shipments-db`.
+- **Local dev**: Aspire AppHost injects connection strings automatically via orchestration.

@@ -1,0 +1,47 @@
+version: '3.3'
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: goodburger-db
+    environment:
+      POSTGRES_DB: goodburger
+      POSTGRES_USER: goodburger
+      POSTGRES_PASSWORD: goodburger123
+    ports:
+      - "5433:5433"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U goodburger"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - goodburger-network
+
+  api:
+    build:
+      context: .
+      dockerfile: src/GoodBurger.Api/Dockerfile
+    container_name: goodburger-api
+    ports:
+      - "8080:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ConnectionStrings__goodburger-db=Host=db;Database=goodburger;Username=goodburger;Password=goodburger123
+      - Jwt__Secret=GoodBurger_SuperSecret_JWT_Key_2024_!@#
+      - Jwt__Issuer=GoodBurger
+      - Jwt__Audience=GoodBurgerClients
+      - Jwt__ExpiresInMinutes=480
+    depends_on:
+      - db
+    networks:
+      - goodburger-network
+      
+volumes:
+  postgres_data:
+
+networks:
+  goodburger-network:
+    driver: bridge
